@@ -57,4 +57,4 @@ $ VBoxManage dhcpserver add --netname lab --netmask 255.255.255.0 --ip 192.168.0
 ```
 
 ## createvm.sh
-See [createvm.sh]
+See [createvm.sh](createvm.sh)
