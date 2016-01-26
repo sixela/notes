@@ -235,7 +235,7 @@ guess_repository () {
 	typeset search_for="x"
 	case "$version" in
 		*SNAPSHOT|LATEST) 	search_for="SNAPSHOT" ;;
-		*|RELEASE)		search_for="RELEASE" ;;
+		*)		search_for="RELEASE" ;;
 	esac
 
 	typeset repository=$(guess_search "$groupId" "$artifactId" | \
