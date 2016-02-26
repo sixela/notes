@@ -45,3 +45,4 @@ to_mp3 () {
 export -f to_mp3
 
 . ./fb5upload.sh
+. ./bashrc_ssh

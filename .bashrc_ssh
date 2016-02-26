@@ -1,0 +1,21 @@
+function start_agent {
+    echo "Initializing new SSH agent..."
+    touch $SSH_ENV
+    chmod 600 "${SSH_ENV}"
+    /usr/bin/ssh-agent | sed 's/^echo/#echo/' >> "${SSH_ENV}"
+    source "${SSH_ENV}" > /dev/null
+    /usr/bin/ssh-add
+}
+
+function slt() {
+	[ -f "${SSH_ENV}" ] && {
+		source "${SSH_ENV}" > /dev/null
+		kill -0 $SSH_AGENT_PID 2>/dev/null || {
+			start_agent
+		}
+	} || {
+		start_agent
+	}
+
+	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $@
+}
