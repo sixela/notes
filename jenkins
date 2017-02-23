@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o nounset
+set -o noglob
+set -o pipefail
+
+TRACE=${TRACE:-no}
+[ "$TRACE" != "no" ] && set -o xtrace
+
+HEADERS=${HEADERS:-"yes"}
+
+CURL="$(which curl)"
+JQ="$(which jq) --exit-status"
+
+_msg () { printf "[$(date --rfc-3339=seconds)] $@\n" ; }
+info () { _msg "[INFO] ${@}" ; }
+warning () { _msg "[WARNING] ${@}" 1>&2 ; }
+error () { _msg "[ERROR] ${@}" 1>&2 ; }
+_headers () { 
+    [ "${HEADERS}" = "yes" ] && { printf "${*}\n" | tr " " "\t"; }
+    return 0
+}
+
+usage () {
+cat <<-EOU
+Usage: ${0} [action] args
+
+Jenkins remote API wrapper
+
+Actions:
+    - builds JOB                List build for given job
+    - build JOB                 Start a build for given job
+    - status JOB [number]       Get details about given build (lastBuild as default)
+    - console JOB [number]      Get console output of build (lastBuild as default). Outputs raw text
+    - jobs [all|failed|success|running] 
+                                List jobs. Default to all
+    - job JOB                   Get details about given job
+    - last JOB                  Get details about last build for given job
+    - search [pattern]          Find job with [pattern] in name. Output a list, not JSON
+    - help                      This help
+
+Env:
+    JENKINS_BASE_URL
+    JENKINS_USER
+
+Examples:
+    \$ ${0} jenkins search selinux
+    cookbook-ubi_selinux-stable-deployment
+    cookbook-ubi_selinux-stable-integration
+    cookbook-ubi_selinux-unstable-deployment
+    cookbook-ubi_selinux-unstable-integration
+
+    \$ ${0} jenkins job cookbook-ubi_selinux-unstable-integration
+    Status  Score Name
+    blue    80    cookbook-ubi_selinux-unstable-integration
+
+    \$ ${0} jenkins builds cookbook-ubi_selinux-unstable-integration
+    70  2016-08-09T14:13:45Z  SUCCESS
+    2015-11-19_13-26-20 2015-11-19T13:26:20Z  SUCCESS
+    2015-11-18_19-44-03 2015-11-18T19:44:03Z  FAILURE
+    2015-11-18_19-37-59 2015-11-18T19:37:59Z  SUCCESS
+    2015-11-18_19-30-57 2015-11-18T19:30:57Z  SUCCESS
+
+    \$ ${0} jenkins last cookbook-ubi_selinux-unstable-integration
+    id  result  timestamp   cause console
+    70  SUCCESS 2016-08-09T14:13:45Z  Started by an SCM change  https://jenkins/job/cookbook-ubi_selinux-unstable-integration/70//consoleText
+EOU
+}
+
+_jenkins () {
+    _jenkins_raw "$@" | \
+    $JQ \
+        --exit-status \
+        '.'
+}
+
+_jenkins_raw () {
+    local JENKINS_PATH=${1?"Missing jenkins path"}
+    local JENKINS_ARGS=${2:-""}
+
+    $CURL \
+        --silent \
+        --user "${JENKINS_USER}" \
+        --header 'Accept: application/json' \
+        --data-urlencode "${JENKINS_ARGS}" \
+        "${JENKINS_BASE_URL}/${JENKINS_PATH}"
+}
+
+jenkins_list () {
+    local JOB_STATE=${1?"Missing job state"}
+    local jq_filter=".jobs[]"
+
+    case "$JOB_STATE" in
+       q*)               jenkins_queue; exit $?;;
+       blue|green|success|ok) 
+                         jq_filter="${jq_filter} | select(.color != \"red\") | .name";;
+       red|fail*)        jq_filter="${jq_filter} | select(.color == \"red\") | .name";;
+       run*)             jq_filter="${jq_filter} | select(.lastBuild.building==true) | .name";;
+       *)                jq_filter="${jq_filter} | .name";;
+    esac
+ 
+    _jenkins "/api/json" "tree=jobs[name,color,lastBuild[building]]" | \
+         $JQ --raw-output "$jq_filter"
+}
+
+jenkins_builds () {
+    local JOB_NAME=${1?"Missing job name"}
+    _jenkins "/job/${JOB_NAME}/api/json" "tree=builds[id,result,timestamp]" | \
+        $JQ --raw-output '.builds[] | {
+            id: .id,
+            timestamp: (.timestamp | tostring | .[0:10] | tonumber | todate),
+            result: .result
+        } | 
+        [ .id, .timestamp, .result ] |
+        @tsv' 
+}
+
+jenkins_job () {
+    local JOB_NAME=${1?"Missing job name"}
+    _headers "Status" "Score" "Name"
+    _jenkins "/job/${JOB_NAME}/api/json" \
+        "tree=displayName,color,healthReport[score]" | \
+        $JQ --raw-output '. | {
+            name: .displayName, 
+            color: .color, 
+            score: .healthReport[0].score
+        } |
+        [ .color, .score, .name ] |
+        @tsv'
+}
+
+jenkins_status () {
+    local JOB_NAME=${1?"Missing job name"}; shift
+    local BUILD=${1:-"lastBuild"}
+    _headers "id" "result" "timestamp" "\tcause" "console"
+    _jenkins "/job/${JOB_NAME}/${BUILD}/api/json" \
+        "tree=id,url,result,timestamp,url,actions[causes[shortDescription]]" | \
+        $JQ --raw-output '. | {
+            id: .id, 
+            console: ([(.url | tostring),"consoleText"] | join("/")),
+            result: (.result // "running"), 
+            timestamp: (.timestamp | tostring | .[0:10] | tonumber | todate), 
+            duration: .estimatedDuration, 
+            cause: .actions[0].causes[0].shortDescription,
+        } |
+        [ .id, .result, .timestamp, .cause, .console ] |
+        @tsv'
+}
+
+jenkins_console () {
+    local JOB_NAME=${1?"Missing job name"}; shift
+    local BUILD=${1:-"lastBuild"}
+    _jenkins_raw "/job/${JOB_NAME}/lastBuild/consoleText"
+}
+
+jenkins_search () {
+    local PATTERN=${1?"Missing pattern"}
+    _jenkins_raw '/api/json' 'tree=jobs[name]' | \
+        $JQ --raw-output \
+            ".jobs[] | .name | select(test(\"${PATTERN}\",\"gxi\"))"
+}
+
+jenkins_build () {
+    local JOB_NAME=${1?"Missing job name"};
+    _jenkins_raw "/job/${JOB_NAME}/build" && {
+        info "Started"
+    } || {
+        error "Failure"
+    }
+}
+
+jenkins_queue () {
+  _headers "Job" "WhyWait" "WhyStart"
+  _jenkins "/queue/api/json" \
+  | $JQ --raw-output '.items[] | {
+    job: .task.name,
+    whywait: .why,
+    whystart: .actions[0].causes[0].shortDescription
+  } |
+  [ .job, .whywait, .whystart ] |
+  @tsv'
+}
+
+ACTION=${1:-"list"} ; shift
+case "$ACTION" in 
+    b|builds)
+        JOB=${1?"Specify job name"}
+        jenkins_builds "$JOB"
+        ;;
+    status)
+        JOB=${1?"Specify job name"}; shift
+        BUILD=${1:-"lastBuild"}
+        jenkins_status "$JOB" "$BUILD"
+        ;;
+    c|console)
+        JOB=${1?"Specify job name"}; shift
+        BUILD=${1:-"lastBuild"}
+        jenkins_console "$JOB"
+        ;;
+    l|list|jobs)
+        STATE=${1:-"all"}
+        jenkins_list "$STATE"
+        ;;
+    q|queue)
+        jenkins_queue
+        ;;
+    last)
+        JOB=${1?"Specify job name"}
+        jenkins_status "$JOB"
+        ;;
+    j|job|status)
+        JOB=${1?"Specify job name"}
+        jenkins_job "$JOB" 
+        ;;
+    s|search|f|find)
+        PATTERN=${1?"Specify pattern"}
+        jenkins_search "$PATTERN"
+        ;;
+    build)
+        JOB=${1?"Specify job name"}
+        jenkins_build "$JOB"
+        ;;
+    -h|h|help|--help)
+        usage
+        exit 0
+        ;;
+    hello)
+        info "Howdy"
+        exit 0
+        ;;
+    *|None)
+        error "Action ${ACTION} doesn't exist"
+        usage
+        exit 1
+        ;;
+esac
